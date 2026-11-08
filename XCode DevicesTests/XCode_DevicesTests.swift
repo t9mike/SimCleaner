@@ -1242,3 +1242,96 @@ struct StoragePanelClearanceTests {
         }
     }
 }
+
+/// Runtime deletion must distinguish a successful command from a verified removal.
+private actor RuntimeDeletionSimctl: CommandRunning {
+    private var present: Set<String> = ["gone", "stays", "error", "delayed"]
+    private var delayedChecks: Int?
+    private(set) var deletionCommands = 0
+    var failListing = false
+
+    func finishDeletion(_ id: String) { present.remove(id) }
+    func setListingFailure(_ fails: Bool) { failListing = fails }
+
+    func run(_ executable: URL, arguments: [String], environment: [String: String]?, standardInput: Data?, timeout: TimeInterval) async throws -> CommandResult {
+        if arguments.contains("runtime"), arguments.contains("delete"), let id = arguments.last {
+            deletionCommands += 1
+            if id == "delayed" { delayedChecks = 0 }
+            if id == "error" {
+                return CommandResult(status: 1, stdout: Data(), stderr: Data("Deletion denied".utf8))
+            }
+            if id == "gone" { present.remove(id) }
+            return CommandResult(status: 0, stdout: Data(), stderr: Data())
+        }
+        if arguments.contains("runtime") {
+            if failListing { return CommandResult(status: 1, stdout: Data(), stderr: Data("Inventory unavailable".utf8)) }
+            if let count = delayedChecks {
+                delayedChecks = count + 1
+                if count >= 2 { present.remove("delayed") }
+            }
+            let images = Dictionary(uniqueKeysWithValues: present.map { ($0, ["version": $0, "deletable": true, "sizeBytes": 0] as [String: Any]) })
+            return CommandResult(status: 0, stdout: try JSONSerialization.data(withJSONObject: images), stderr: Data())
+        }
+        return CommandResult(status: 0, stdout: Data("{\"devices\":{}}".utf8), stderr: Data())
+    }
+}
+
+// These fixtures share runtime IDs, which participate in the app-wide operation locks.
+@Suite(.serialized)
+@MainActor
+struct RuntimeDeletionFlowTests {
+    @Test func mixedBatchReportsEveryRuntimeAndContinuesAfterFailures() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let tool = SimctlTool(executable: URL(fileURLWithPath: "/usr/bin/xcrun"), leadingArguments: ["simctl"], developerDirectory: nil, source: .xcrun)
+        let scanner = DeviceScanner(devicesURL: fixture.root, sandboxed: false, runner: RuntimeDeletionSimctl(), capabilities: Capabilities(isSandboxed: false, simctl: .success(tool), coreSimulatorInstalled: true), developerFolder: fixture.root, restoresBookmark: false)
+        let items = ["stays", "error", "gone"].map {
+            RuntimeEntry(source: .simctl(imageID: $0), platform: .iOS, version: $0, build: nil, runtimeIdentifier: nil, sizeBytes: 0, lastUsedAt: nil, isDeletable: true, state: nil)
+        }
+        await scanner.deleteRuntimes(items, verificationDelay: .zero)
+        let report = try #require(scanner.report)
+        let message = try #require(report.message)
+        #expect(report.failures.count == 2)
+        #expect(message.contains("Verified deleted:\niOS gone"))
+        #expect(message.contains("iOS error: Deletion denied"))
+        #expect(message.components(separatedBy: "iOS stays").count == 2)
+        #expect(message.components(separatedBy: "Settings › Components").count == 2)
+        #expect(scanner.busy.isEmpty)
+
+        await scanner.deleteRuntimes([items[2]], verificationDelay: .zero)
+        #expect(scanner.report?.failures.isEmpty == true)
+        #expect(scanner.report?.message == "Verified deleted:\niOS gone")
+    }
+}
+
+extension RuntimeDeletionFlowTests {
+    @Test func delayedDeletionAndManualRecheckNeverDeleteTwice() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let tool = SimctlTool(executable: URL(fileURLWithPath: "/usr/bin/xcrun"), leadingArguments: ["simctl"], developerDirectory: nil, source: .xcrun)
+        let runner = RuntimeDeletionSimctl()
+        let scanner = DeviceScanner(devicesURL: fixture.root, sandboxed: false, runner: runner, capabilities: Capabilities(isSandboxed: false, simctl: .success(tool), coreSimulatorInstalled: true), developerFolder: fixture.root, restoresBookmark: false)
+        let items = ["delayed", "stays"].map {
+            RuntimeEntry(source: .simctl(imageID: $0), platform: .iOS, version: $0, build: nil, runtimeIdentifier: nil, sizeBytes: 0, lastUsedAt: nil, isDeletable: true, state: nil)
+        }
+        await scanner.deleteRuntimes(items, verificationDelay: .zero)
+        let pending = try #require(scanner.report)
+        #expect(pending.verifiedRuntimeNames == ["iOS delayed"])
+        #expect(pending.runtimesToVerify.map(\.id) == ["stays"])
+        #expect(pending.message?.contains("restart") == false)
+        #expect(await runner.deletionCommands == 2)
+
+        // An unreadable inventory must never be treated as an empty one.
+        await runner.setListingFailure(true)
+        await scanner.checkRuntimeDeletions(pending, verificationDelay: .zero)
+        #expect(scanner.report?.runtimesToVerify.map(\.id) == ["stays"])
+        #expect(scanner.report?.verifiedRuntimeNames == ["iOS delayed"])
+        await runner.setListingFailure(false)
+        await runner.finishDeletion("stays")
+        await scanner.checkRuntimeDeletions(try #require(scanner.report), verificationDelay: .zero)
+        #expect(scanner.report?.runtimesToVerify.isEmpty == true)
+        #expect(scanner.report?.failures.isEmpty == true)
+        #expect(scanner.report?.verifiedRuntimeNames == ["iOS delayed", "iOS stays"])
+        #expect(await runner.deletionCommands == 2)
+    }
+}

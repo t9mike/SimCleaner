@@ -11,12 +11,31 @@ import SwiftUI
 /// only show them, because the sandbox hides runtimes from simctl.
 struct RuntimesView: View {
     @ObservedObject var scanner: DeviceScanner
-    @State private var selection: RuntimeEntry.ID?
-    @State private var pendingDeletion: RuntimeEntry?
+    @State private var selection: Set<RuntimeEntry.ID> = []
+    @AppStorage("runtimes.sortColumn") private var sortColumn = RuntimeSortColumn.runtime.rawValue
+    @AppStorage("runtimes.sortDescending") private var sortDescending = false
+    @State private var pendingDeletion: [RuntimeEntry]?
 
-    private var selected: RuntimeEntry? {
-        scanner.runtimes.first { $0.id == selection }
+    private var selected: [RuntimeEntry] {
+        sortedRuntimes.filter { selection.contains($0.id) }
     }
+
+    private var sortOrder: [KeyPathComparator<RuntimeEntry>] {
+        var comparator = (RuntimeSortColumn(rawValue: sortColumn) ?? .runtime).comparator
+        comparator.order = sortDescending ? .reverse : .forward
+        return [comparator]
+    }
+
+    private var sortBinding: Binding<[KeyPathComparator<RuntimeEntry>]> {
+        Binding(get: { sortOrder }, set: { comparators in
+            guard let first = comparators.first,
+                  let column = RuntimeSortColumn.allCases.first(where: { $0.comparator.keyPath == first.keyPath }) else { return }
+            sortColumn = column.rawValue
+            sortDescending = first.order == .reverse
+        })
+    }
+
+    private var sortedRuntimes: [RuntimeEntry] { scanner.runtimes.sorted(using: sortOrder) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,16 +48,18 @@ struct RuntimesView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Select All") { selection = Set(scanner.runtimes.map(\.id)) }
+                    .disabled(scanner.runtimes.isEmpty)
                 if scanner.canManageRuntimes {
                     Button(role: .destructive) {
                         pendingDeletion = selected
                     } label: {
-                        Text("Delete Runtime…")
+                        Text(selected.count > 1 ? "Delete \(selected.count) Runtimes…" : "Delete Runtime…")
                     }
                     .buttonStyle(.bordered)
                     .tint(.red)
-                    .disabled(selected?.isDeletable != true || !scanner.busy.isEmpty)
-                    .help(selected?.isDeletable == false ? "CoreSimulator says this runtime can't be deleted (it may ship inside Xcode)." : "Delete the selected runtime")
+                    .disabled(selected.isEmpty || !selected.allSatisfy { $0.isDeletable == true && $0.simctlImageID != nil } || !scanner.busy.isEmpty)
+                    .help("Delete the selected runtimes. All selected runtimes must be deletable.")
                 }
             }
             .padding(.horizontal, 14)
@@ -78,8 +99,8 @@ struct RuntimesView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Table(scanner.runtimes, selection: $selection) {
-                    TableColumn("Runtime") { runtime in
+                Table(sortedRuntimes, selection: $selection, sortOrder: sortBinding) {
+                    TableColumn("Runtime", value: \.title) { runtime in
                         HStack(spacing: 6) {
                             Text(runtime.title)
                             if scanner.busy[runtime.id] != nil {
@@ -87,17 +108,17 @@ struct RuntimesView: View {
                             }
                         }
                     }
-                    TableColumn("Simulators") { runtime in
+                    TableColumn("Simulators", value: \.deviceCount) { runtime in
                         Text(runtime.deviceCount == 0 ? "None" : "\(runtime.deviceCount)")
                             .foregroundStyle(runtime.deviceCount == 0 ? .secondary : .primary)
                     }
                     .width(90)
-                    TableColumn("Last used") { runtime in
+                    TableColumn("Last used", value: \.lastUsedSortKey) { runtime in
                         Text(runtime.lastUsedAt?.relativeDescription ?? "—")
                             .foregroundStyle(.secondary)
                     }
                     .width(140)
-                    TableColumn("Size") { runtime in
+                    TableColumn("Size", value: \.sizeBytes) { runtime in
                         Text(ByteText.string(runtime.sizeBytes))
                             .font(.callout.weight(.semibold))
                             .frame(maxWidth: .infinity, alignment: .trailing)
@@ -113,20 +134,31 @@ struct RuntimesView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .confirmationDialog("Delete \(pendingDeletion?.title ?? "runtime")?", isPresented: Binding(get: { pendingDeletion != nil }, set: { if !$0 { pendingDeletion = nil } }), titleVisibility: .visible, presenting: pendingDeletion) { runtime in
+        .onChange(of: scanner.runtimes) { _, runtimes in
+            selection.formIntersection(runtimes.map(\.id))
+        }
+        .confirmationDialog(deletionTitle, isPresented: Binding(get: { pendingDeletion != nil }, set: { if !$0 { pendingDeletion = nil } }), titleVisibility: .visible, presenting: pendingDeletion) { runtimes in
             Button("Delete", role: .destructive) {
-                Task { await scanner.deleteRuntime(runtime) }
+                Task { await scanner.deleteRuntimes(runtimes) }
             }
             Button("Cancel", role: .cancel) {}
-        } message: { runtime in
-            Text(deletionMessage(runtime))
+        } message: { runtimes in
+            Text(deletionMessage(runtimes))
         }
     }
 
-    private func deletionMessage(_ runtime: RuntimeEntry) -> String {
-        var text = "Frees \(ByteText.string(runtime.sizeBytes))."
-        if runtime.deviceCount > 0 {
-            text += " \(runtime.deviceCount) \(runtime.deviceCount == 1 ? "simulator uses" : "simulators use") it and will stop working until you download the runtime again in Xcode › Settings › Components."
+    private var deletionTitle: String {
+        guard let pendingDeletion else { return "Delete runtimes?" }
+        return pendingDeletion.count == 1 ? "Delete \(pendingDeletion[0].title)?" : "Delete \(pendingDeletion.count) runtimes?"
+    }
+
+    private func deletionMessage(_ runtimes: [RuntimeEntry]) -> String {
+        let bytes = runtimes.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        let devices = runtimes.reduce(0) { $0 + $1.deviceCount }
+        var text = runtimes.map(\.title).joined(separator: "\n")
+        text += "\n\nMay free \(ByteText.string(bytes)) once deletion is confirmed."
+        if devices > 0 {
+            text += " \(devices) \(devices == 1 ? "simulator uses" : "simulators use") these runtimes and will stop working until you download them again in Xcode › Settings › Components."
         }
         return text
     }
@@ -172,4 +204,26 @@ struct CommandRow: View {
         .padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.gray.opacity(0.08)))
     }
+}
+
+private enum RuntimeSortColumn: String, CaseIterable {
+    case runtime, simulators, lastUsed, size
+
+    var comparator: KeyPathComparator<RuntimeEntry> {
+        switch self {
+        case .runtime: KeyPathComparator(\.title)
+        case .simulators: KeyPathComparator(\.deviceCount)
+        case .lastUsed: KeyPathComparator(\.lastUsedSortKey)
+        case .size: KeyPathComparator(\.sizeBytes)
+        }
+    }
+}
+
+private extension RuntimeEntry {
+    var lastUsedSortKey: Date { lastUsedAt ?? .distantPast }
+}
+
+#Preview {
+    RuntimesView(scanner: DeviceScanner(sandboxed: true, restoresBookmark: false))
+        .frame(width: 760, height: 480)
 }

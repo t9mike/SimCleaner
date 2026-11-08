@@ -69,11 +69,14 @@ struct SmartCleanupResult: Equatable {
     let failures: [String]
 }
 
-/// What went wrong in the last batch, so the window can say it instead of failing silently.
+/// The last batch result, including optional detail for operations that also report successes.
 struct OperationReport: Identifiable, Equatable {
     let id = UUID()
     let title: String
     let failures: [String]
+    var message: String? = nil
+    var runtimesToVerify: [RuntimeEntry] = []
+    var verifiedRuntimeNames: [String] = []
 }
 
 @MainActor
@@ -531,23 +534,63 @@ final class DeviceScanner: ObservableObject {
         refreshDeveloperStorage(force: true)
     }
 
-    func deleteRuntime(_ runtime: RuntimeEntry) async {
-        guard let imageID = runtime.simctlImageID, let tool = capabilities?.simctlTool, canManageRuntimes else { return }
+    func deleteRuntimes(_ items: [RuntimeEntry], verificationDelay: Duration = .seconds(1)) async {
+        await processRuntimeDeletions(items, delete: true, previouslyVerified: [], verificationDelay: verificationDelay)
+    }
+
+    /// Rechecks inventory only; never submits another deletion command.
+    func checkRuntimeDeletions(_ previous: OperationReport, verificationDelay: Duration = .seconds(1)) async {
+        await processRuntimeDeletions(previous.runtimesToVerify, delete: false, previouslyVerified: previous.verifiedRuntimeNames, verificationDelay: verificationDelay)
+    }
+
+    private func processRuntimeDeletions(_ items: [RuntimeEntry], delete: Bool, previouslyVerified: [String], verificationDelay: Duration) async {
+        guard !items.isEmpty, let tool = capabilities?.simctlTool, canManageRuntimes else { return }
         let simctl = SimctlClient(tool: tool, runner: runner)
+        var verified: [RuntimeEntry] = []
+        var stillListed: [String] = []
         // CoreSimulator's own list is the proof here, before and after: the image lives where SimCleaner
         // doesn't look. One another window already deleted isn't listed any more and counts nothing.
-        let deleted = await perform("Deleting", title: "Couldn't confirm deletion of \(runtime.title)", items: [runtime], id: \.id, name: \.title, freed: FreedSpace { runtime in
-            guard let listed = try? await simctl.listRuntimeImages().first(where: { $0.identifier == imageID }) else { return nil }
+        let outcome = await perform(delete ? "Deleting" : "Checking", title: "Couldn't confirm runtime deletion", items: items, id: \.id, name: \.title, freed: FreedSpace { runtime in
+            guard let imageID = runtime.simctlImageID,
+                  let listed = try? await simctl.listRuntimeImages().first(where: { $0.identifier == imageID }) else { return nil }
             let size = listed.sizeBytes ?? runtime.sizeBytes
             return { deleted in deleted ? size : 0 }
-        }) { _ in
-            _ = try await simctl.deleteRuntime(imageID, dryRun: false)
-            // Xcode 27.0 sometimes reports success and brings the runtime back; check before claiming it's gone.
-            if try await simctl.listRuntimeImages().contains(where: { $0.identifier == imageID }) {
-                throw DeviceOperationError.simctl("CoreSimulator still lists \(runtime.title). It may be removed after a restart; if it stays, delete it in Xcode › Settings › Components.")
+        }) { runtime in
+            guard runtime.isDeletable == true, let imageID = runtime.simctlImageID else {
+                throw DeviceOperationError.simctl("This runtime can't be deleted through CoreSimulator.")
             }
-        }.cleaned
-        let ids = Set(deleted.map(\.id))
+            if delete { _ = try await simctl.deleteRuntime(imageID, dryRun: false) }
+            // The command can finish before CoreSimulator's inventory changes. Give it three
+            // additional checks without blocking the main actor or submitting deletion again.
+            for attempt in 0..<4 {
+                try Task.checkCancellation()
+                if attempt > 0 { try await Task.sleep(for: verificationDelay) }
+                let images = try await simctl.listRuntimeImages()
+                if !images.contains(where: { $0.identifier == imageID }) {
+                    // Verification is independent of whether the size is known or credited.
+                    verified.append(runtime)
+                    runtimes.removeAll { $0.id == runtime.id }
+                    return
+                }
+                busy[runtime.id] = "Waiting for deletion…"
+            }
+            stillListed.append(runtime.title)
+            throw DeviceOperationError.simctl("CoreSimulator still lists this runtime.")
+        }
+        var sections: [String] = []
+        if !outcome.failures.isEmpty {
+            let unverified = outcome.failures.map { failure in
+                stillListed.first(where: { failure == "\($0): CoreSimulator still lists this runtime." }).map { "\($0) (still listed)" } ?? failure
+            }
+            sections.append("Couldn't confirm deletion:\n" + unverified.joined(separator: "\n"))
+        }
+        if !stillListed.isEmpty {
+            sections.append("CoreSimulator still lists these runtimes; deletion may still be finishing. Choose Check Again to refresh their status. If they remain listed, try Xcode › Settings › Components.")
+        }
+        let verifiedNames = previouslyVerified + verified.map(\.title)
+        sections.append("Verified deleted:\n" + (verifiedNames.isEmpty ? "None" : verifiedNames.joined(separator: "\n")))
+        let ids = Set(verified.map(\.id))
+        report = OperationReport(title: outcome.failures.isEmpty ? "Runtime deletion complete" : "Couldn't confirm all runtime deletions", failures: outcome.failures, message: sections.joined(separator: "\n\n"), runtimesToVerify: items.filter { !ids.contains($0.id) }, verifiedRuntimeNames: verifiedNames)
         runtimes.removeAll { ids.contains($0.id) }
         refreshRuntimes(force: true)
     }

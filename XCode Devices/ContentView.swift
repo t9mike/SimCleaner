@@ -210,10 +210,15 @@ struct ContentView: View {
         } message: { pending in
             Text(uninstallMessage(for: pending))
         }
-        .alert(scanner.report?.title ?? "", isPresented: hasReport, presenting: scanner.report) { _ in
+        .alert(scanner.report?.title ?? "", isPresented: hasReport, presenting: scanner.report) { report in
+            if !report.runtimesToVerify.isEmpty {
+                Button("Check Again") {
+                    Task { await scanner.checkRuntimeDeletions(report) }
+                }
+            }
             Button("OK", role: .cancel) {}
         } message: { report in
-            Text("The list now shows what's left.\n\n" + report.failures.joined(separator: "\n"))
+            Text(report.message ?? ("The list now shows what's left.\n\n" + report.failures.joined(separator: "\n")))
         }
         .sheet(isPresented: $showPermissionSheet) {
             PermissionRequestSheet {
