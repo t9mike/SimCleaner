@@ -536,7 +536,7 @@ final class DeviceScanner: ObservableObject {
         let simctl = SimctlClient(tool: tool, runner: runner)
         // CoreSimulator's own list is the proof here, before and after: the image lives where SimCleaner
         // doesn't look. One another window already deleted isn't listed any more and counts nothing.
-        let deleted = await perform("Deleting", title: "\(runtime.title) wasn't deleted", items: [runtime], id: \.id, name: \.title, freed: FreedSpace { runtime in
+        let deleted = await perform("Deleting", title: "Couldn't confirm deletion of \(runtime.title)", items: [runtime], id: \.id, name: \.title, freed: FreedSpace { runtime in
             guard let listed = try? await simctl.listRuntimeImages().first(where: { $0.identifier == imageID }) else { return nil }
             let size = listed.sizeBytes ?? runtime.sizeBytes
             return { deleted in deleted ? size : 0 }
